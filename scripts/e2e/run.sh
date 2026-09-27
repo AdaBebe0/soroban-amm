@@ -16,7 +16,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e/common.sh
 source "$ROOT_DIR/e2e/common.sh"
 
-ALL_FLOWS=(v2 factory cl governance staking)
+ALL_FLOWS=(v2 factory cl governance staking twap)
 
 ONLY_RAW=""
 SKIP_RAW=""
@@ -86,6 +86,8 @@ source "$ROOT_DIR/e2e/cl.sh"
 source "$ROOT_DIR/e2e/governance.sh"
 # shellcheck source=scripts/e2e/staking.sh
 source "$ROOT_DIR/e2e/staking.sh"
+# shellcheck source=scripts/e2e/twap.sh
+source "$ROOT_DIR/e2e/twap.sh"
 
 declare -A FLOW_STATUS
 declare -A FLOW_DURATION
@@ -121,6 +123,7 @@ run_flow_isolated factory run_factory_flow
 run_flow_isolated cl run_cl_flow
 run_flow_isolated governance run_governance_flow
 run_flow_isolated staking run_staking_flow
+run_flow_isolated twap run_twap_flow
 
 printf '\n%s\n' "Summary"
 printf '%s\n' "-------"

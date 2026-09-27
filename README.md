@@ -291,7 +291,7 @@ An integration contract that reads the AMM's cumulative price oracle and compute
 
 | Function | Description |
 |---|---|
-| `save_snapshot(pool)` | Stores `(cum_a, cum_b, pool_ts)` under `Snapshot(pool, pool_ts)` |
+| `save_snapshot(pool)` | Appends `(ledger_ts, cum_a, cum_b, pool_ts)` to the pool's single `Snapshots(pool)` entry (keeper only; at most `MAX_SNAPSHOTS_PER_POOL`, oldest dropped) |
 | `get_twap_price(pool, window_seconds) → i128` | Returns `(cum_a_now - cum_a_then) / window_seconds`, where `cum_a_then` comes from the snapshot at `now_ts - window_seconds` |
 | `validate_price(spot_price, twap_price, max_deviation_bps) → PriceValidation` | Compares a real-time price against TWAP and flags deviations above a configurable basis-point threshold |
 | `validate_price_against_twap(pool, window_seconds, spot_price, max_deviation_bps) → PriceValidation` | Reads TWAP from saved snapshots and validates the supplied AMM spot price |
