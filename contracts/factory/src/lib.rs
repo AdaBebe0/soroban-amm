@@ -119,6 +119,7 @@ pub trait GovernanceInterface {
         quorum_bps: i128,
         min_proposer_stake_bps: i128,
     );
+    fn claim_lp_locker(env: Env);
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -381,6 +382,15 @@ impl Factory {
             &admin,  // fee_recipient
             &0_i128, // protocol_fee_bps (disabled by default)
         );
+
+        // `governance::vote` locks LP tokens through `LpToken::lock`, which only
+        // the token's locker may authorise. The LP token starts with the pool
+        // as its locker and only the pool can change it, so governance — now
+        // the pool admin — asks the pool to delegate the locker to itself
+        // (issue #986). Without this every vote traps.
+        if let Some(gov) = &gov_addr {
+            GovernanceClient::new(&env, gov).claim_lp_locker();
+        }
 
         // Register pool in lookup indexes and record the LP token address.
         // These are per-pool entries and grow without bound as pools accumulate,

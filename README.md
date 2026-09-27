@@ -190,6 +190,7 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `pause(admin)` | Pause state-changing pool operations; requires `admin` auth |
 | `unpause(admin)` | Resume state-changing pool operations; requires `admin` auth |
 | `is_paused() → bool` | Read the current pause state |
+| `set_lp_locker(locker)` | Make `locker` the LP token's locker (normally the governance contract, so `vote` can lock LP tokens); requires admin auth |
 | `flash_loan(receiver, token, amount, data) → fee` | Borrow pool reserves and repay within the receiver callback |
 | `add_liquidity(provider, amount_a, amount_b, min_shares, deadline) → shares` | Deposit tokens, receive LP shares |
 | `remove_liquidity(provider, shares, min_a, min_b, deadline) → (a, b)` | Burn LP shares, withdraw tokens |
@@ -267,6 +268,7 @@ Allows LP token holders to propose and vote on parameter changes to a pool on-ch
 | `execute(proposal_id)` | Execute a passing proposal after the voting period ends |
 | `cancel_proposal(proposal_id, proposer)` | Cancel a pending proposal before voting ends |
 | `unlock_vote(voter, proposal_id)` | Release vote-locked LP tokens after a proposal is resolved |
+| `claim_lp_locker()` | Make this contract the LP token's locker; succeeds only while governance is the pool admin (the factory calls it in `create_pool`) |
 | `get_proposal(proposal_id) → Proposal` | Read proposal details |
 | `get_proposal_count() → u32` | Total proposals ever created; ids run `[0, count)` |
 | `get_proposals_paginated(offset, limit) → Vec<Proposal>` | Read a page of proposals in creation order |
@@ -278,6 +280,7 @@ Allows LP token holders to propose and vote on parameter changes to a pool on-ch
 
 - Voting power is snapshotted at the time `vote` is called, based on current LP token balance.
 - LP tokens used to vote are locked until `unlock_vote` is called after the proposal resolves.
+- Locking requires governance to be the LP token's locker, and only the pool can change the locker. `factory::create_pool` wires this automatically when it deploys governance. For a governance contract deployed separately, the pool admin calls the pool's `set_lp_locker(governance)`; `scripts/deploy/governance.sh` does this and fails the deploy if the locker cannot be read back as governance.
 - A proposal passes if `for_votes / total_supply ≥ quorum_bps / 10_000` and `for_votes > against_votes`.
 - Only the original proposer can cancel a proposal, and only before the voting period ends.
 

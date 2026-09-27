@@ -352,6 +352,7 @@ pub trait AmmPoolInterface {
     fn unpause(env: Env);
     fn emergency_withdraw(env: Env, to: Address);
     fn propose_admin(env: Env, current_admin: Address, new_admin: Address);
+    fn set_lp_locker(env: Env, locker: Address);
 }
 
 // ── Factory client ────────────────────────────────────────────────────────────
@@ -455,6 +456,26 @@ impl Governance {
             .instance()
             .set(&DataKey::QuorumDecayRateBpsPerDay, &0i128);
         env.storage().instance().set(&DataKey::ProposalCount, &0u32);
+        Ok(())
+    }
+
+    /// Make this contract the LP token's locker (issue #986).
+    ///
+    /// `vote` locks voting LP tokens through `LpToken::lock`, which needs the
+    /// token's locker to authorise, and only the pool can change the locker.
+    /// When this contract is the pool's admin — every pool the factory creates
+    /// with governance — it asks the pool to delegate by calling
+    /// `set_lp_locker` itself, which satisfies the pool's admin check. The
+    /// factory calls this during `create_pool`.
+    ///
+    /// Callable by anyone: it can only ever point the locker at this contract,
+    /// and only succeeds while this contract administers the pool, which is
+    /// exactly when it must be the locker for voting to work. When the pool
+    /// has some other admin, that admin calls the pool's `set_lp_locker`
+    /// directly instead.
+    pub fn claim_lp_locker(env: Env) -> Result<(), GovernanceError> {
+        let amm_pool = Self::read_amm_pool(&env)?;
+        AmmPoolClient::new(&env, &amm_pool).set_lp_locker(&env.current_contract_address());
         Ok(())
     }
 
