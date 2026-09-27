@@ -999,6 +999,18 @@ Notes:
 - Returned TWAP is scaled the same way as AMM spot price (`1_000_000` scale factor).
 - `max_deviation_bps` is configurable per integration; for example, `500` allows a 5% spot/TWAP difference.
 
+### Client SDKs
+
+| Language | Package | Covers |
+|---|---|---|
+| TypeScript | [`packages/sdk`](packages/sdk) (`@soroban-amm/sdk`) | AMM pool, factory, governance, concentrated liquidity, staking, incentive campaigns, router |
+| Go | [`packages/go-sdk`](packages/go-sdk) | AMM pool (`contracts/amm`), with its own envelope, ScVal and RPC code and no third-party dependencies |
+| Rust | [`contracts/amm-sdk`](contracts/amm-sdk) (`soroban_amm_sdk`) | typed client, shared types and event decoders for the AMM contracts |
+
+There is no mobile SDK. Android and iOS apps can call the pools through the
+Soroban RPC with any Stellar SDK for their platform, using the Go SDK as a
+reference for envelope construction and ScVal encoding.
+
 ### TypeScript Client Example
 
 A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting with `get_amount_out()`, executing `swap()`, and reading LP shares with `shares_of()`.
