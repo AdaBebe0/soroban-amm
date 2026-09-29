@@ -31,12 +31,24 @@ pub enum TwapError {
     PriceManipulated = 11,
     InvalidRetentionPolicy = 12,
     Unauthorized = 13,
+    /// A cross-contract call into a pool's oracle interface failed: the pool
+    /// does not implement the function its tracked type implies
+    /// (`get_price_cumulative` for `Amm`, `get_tick_cumulative` for `Cl`),
+    /// the address is not a contract, or the callee panicked. Reported
+    /// instead of trapping so a caller can tell a bad pool from a broken
+    /// consumer (#964).
+    CrossContractCallFailed = 14,
 }
 
 #[contracttype]
 pub enum DataKey {
     Keeper,
     Snapshot(Address, u64),
+    /// Legacy tracked-pool list: a bare `Vec<Address>` with no pool type,
+    /// written by contract versions before #964. Read only as a fallback when
+    /// `TrackedPools` is absent; every entry is interpreted as `PoolType::Amm`,
+    /// which is how `get_twap_all` read them. Removed on the first write of
+    /// the typed list.
     TrackedPoolsPersistent,
     /// Sorted (ascending, deduplicated) ledger timestamps at which a snapshot
     /// was saved for this pool. Lets `get_twap_*` binary-search for the most
@@ -44,6 +56,41 @@ pub enum DataKey {
     /// requiring an exact-timestamp hit (issue #469).
     SnapshotTimestamps(Address),
     RetentionPolicy,
+    /// Typed tracked-pool list (`Vec<TrackedPool>`), replacing the untyped
+    /// `TrackedPoolsPersistent` (#964).
+    TrackedPools,
+}
+
+/// Which oracle interface a tracked pool exposes, and therefore which TWAP
+/// path reads it. Mirrors `twal_consumer::PoolType`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PoolType {
+    /// Constant-product pool: `get_price_cumulative`, read by `get_twap_price`.
+    Amm,
+    /// Concentrated-liquidity pool: `get_tick_cumulative`, read by `get_cl_twap`.
+    Cl,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackedPool {
+    pub address: Address,
+    pub pool_type: PoolType,
+}
+
+/// One pool's result from `get_twap_all`, tagged with the pool's type because
+/// the two kinds of pool report different quantities:
+///
+/// * `Amm`: `twap` is the time-weighted price from `get_twap_price`.
+/// * `Cl`: `twap` is the time-weighted mean tick from `get_cl_twap`, widened
+///   losslessly from `i64`. Convert it to a price with `1.0001^tick`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapEntry {
+    pub pool: Address,
+    pub pool_type: PoolType,
+    pub twap: i128,
 }
 
 #[contracttype]
@@ -93,7 +140,32 @@ impl TwapConsumer {
     /// Maximum number of eligible snapshots opportunistically pruned during save_snapshot.
     pub const AMORTIZED_PRUNE_LIMIT: u32 = 2;
 
+    /// Instance-storage TTL: below this many remaining ledgers, `extend_ttl`
+    /// renews the entry; each renewal bumps it back up to `INSTANCE_TTL_BUMP_TO`.
+    ///
+    /// The instance entry holds the keeper address and retention policy —
+    /// the state every entrypoint needs just to authorize or read. Oracle
+    /// consumers like this one are read by other protocols sporadically
+    /// rather than driven by steady user traffic (see #910), so the
+    /// threshold can't assume frequent calls will keep it alive on their
+    /// own. `172_800` ledgers (~10 days at 5s/ledger) is the same floor
+    /// `contracts/amm` uses for its own instance entry, chosen so a renewal
+    /// still has slack before the ~30-day (`518_400`-ledger) archival
+    /// horizon docs generally assume for a "recently touched" contract.
+    pub const INSTANCE_TTL_THRESHOLD: u32 = 172_800;
+    pub const INSTANCE_TTL_BUMP_TO: u32 = 518_400;
+
+    /// Extends the contract's **instance** storage TTL (keeper, retention
+    /// policy). Safe to call on every entrypoint — `extend_ttl` is a no-op
+    /// until the entry's remaining TTL drops below `INSTANCE_TTL_THRESHOLD`.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_BUMP_TO);
+    }
+
     pub fn initialize(env: Env, keeper: Address) -> Result<(), TwapError> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Keeper) {
             return Err(TwapError::AlreadyInitialized);
         }
@@ -102,6 +174,7 @@ impl TwapConsumer {
     }
 
     pub fn get_keeper(env: Env) -> Result<Address, TwapError> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Keeper)
@@ -120,6 +193,7 @@ impl TwapConsumer {
         admin: Address,
         policy: RetentionPolicy,
     ) -> Result<(), TwapError> {
+        Self::extend_instance_ttl(&env);
         let keeper = Self::get_keeper(env.clone())?;
         if admin != keeper {
             return Err(TwapError::Unauthorized);
@@ -139,6 +213,7 @@ impl TwapConsumer {
     /// Returns the active retention policy, or a default policy with
     /// `max_age_seconds = 604_800` (7 days) and `max_snapshots_per_pool = 0` (unlimited).
     pub fn get_retention_policy(env: Env) -> RetentionPolicy {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::RetentionPolicy)
@@ -150,6 +225,7 @@ impl TwapConsumer {
 
     /// Returns the number of snapshots tracked in the index for `pool`.
     pub fn get_snapshot_count(env: Env, pool: Address) -> u32 {
+        Self::extend_instance_ttl(&env);
         let timestamps: Vec<u64> = env
             .storage()
             .persistent()
@@ -160,6 +236,7 @@ impl TwapConsumer {
 
     /// Returns a paginated slice of snapshot timestamps for `pool`.
     pub fn list_snapshot_timestamps(env: Env, pool: Address, offset: u32, limit: u32) -> Vec<u64> {
+        Self::extend_instance_ttl(&env);
         let timestamps: Vec<u64> = env
             .storage()
             .persistent()
@@ -185,6 +262,7 @@ impl TwapConsumer {
         to_ts: u64,
         limit: u32,
     ) -> Vec<(u64, PriceSnapshot)> {
+        Self::extend_instance_ttl(&env);
         let timestamps: Vec<u64> = env
             .storage()
             .persistent()
@@ -211,8 +289,9 @@ impl TwapConsumer {
     }
 
     pub fn save_snapshot(env: Env, pool: Address) -> Result<(), TwapError> {
+        Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
-        let (cum_a, cum_b, pool_ts) = AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
+        let (cum_a, cum_b, pool_ts) = Self::amm_price_cumulative(&env, &pool)?;
         let ledger_ts = env.ledger().timestamp();
         let snapshot = PriceSnapshot {
             cum_a,
@@ -227,30 +306,7 @@ impl TwapConsumer {
             Self::SNAPSHOT_TTL_LEDGERS,
         );
         Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
-
-        let mut tracked: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TrackedPoolsPersistent)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut already_tracked = false;
-        for i in 0..tracked.len() {
-            if tracked.get(i).unwrap() == pool {
-                already_tracked = true;
-                break;
-            }
-        }
-        if !already_tracked {
-            tracked.push_back(pool.clone());
-            env.storage()
-                .persistent()
-                .set(&DataKey::TrackedPoolsPersistent, &tracked);
-            env.storage().persistent().extend_ttl(
-                &DataKey::TrackedPoolsPersistent,
-                Self::SNAPSHOT_TTL_LEDGERS / 2,
-                Self::SNAPSHOT_TTL_LEDGERS,
-            );
-        }
+        Self::register_tracked_pool(&env, &pool, PoolType::Amm);
 
         // Opportunistic bounded amortised pruning
         let _ = Self::prune_snapshots_internal(&env, &pool, Self::AMORTIZED_PRUNE_LIMIT);
@@ -260,6 +316,7 @@ impl TwapConsumer {
     /// Deletes a price snapshot from persistent storage.
     /// Returns `TwapError::NoSnapshotFound` and emits no event if the snapshot does not exist.
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
+        Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
         let key = DataKey::Snapshot(pool.clone(), ledger_ts);
         if !env.storage().persistent().has(&key) {
@@ -267,8 +324,11 @@ impl TwapConsumer {
         }
         env.storage().persistent().remove(&key);
         Self::remove_snapshot_timestamp(&env, &pool, ledger_ts);
-        env.events()
-            .publish((symbol_short!("snap_del"), pool), ledger_ts);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (symbol_short!("snap_del"), pool),
+            ledger_ts
+        );
         Ok(())
     }
 
@@ -320,9 +380,10 @@ impl TwapConsumer {
                 Self::SNAPSHOT_TTL_LEDGERS,
             );
             let oldest_remaining_ts = remaining_timestamps.first().unwrap_or(0);
-            env.events().publish(
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
                 (symbol_short!("pruned"), pool.clone()),
-                (remove_count, oldest_remaining_ts),
+                (remove_count, oldest_remaining_ts)
             );
         }
 
@@ -331,20 +392,111 @@ impl TwapConsumer {
 
     /// Permissionless bounded pruning for a pool according to the active retention policy.
     pub fn prune_snapshots(env: Env, pool: Address, max_to_remove: u32) -> u32 {
+        Self::extend_instance_ttl(&env);
         Self::prune_snapshots_internal(&env, &pool, max_to_remove)
     }
 
     /// Permissionless sweep across all tracked pools, removing up to `max_to_remove_per_pool`
     /// eligible snapshots per pool. Fault-isolated so one pool cannot abort the sweep.
     pub fn prune_all(env: Env, max_to_remove_per_pool: u32) -> u32 {
+        let tracked = Self::load_tracked(&env);
+        Self::extend_instance_ttl(&env);
         let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
         let mut total_removed = 0u32;
         for i in 0..tracked.len() {
-            let pool = tracked.get(i).unwrap();
+            let pool = tracked.get(i).unwrap().address;
             let removed = Self::prune_snapshots_internal(&env, &pool, max_to_remove_per_pool);
             total_removed = total_removed.saturating_add(removed);
         }
         total_removed
+    }
+
+    /// Reads the tracked-pool set, falling back to the legacy untyped list.
+    ///
+    /// Migration (#964): contract versions before the typed list stored a
+    /// bare `Vec<Address>` under `TrackedPoolsPersistent`. When `TrackedPools`
+    /// has not been written yet, that list is read with every entry typed as
+    /// `PoolType::Amm`, which is exactly how the old `get_twap_all` read it. A
+    /// legacy entry that is really a CL pool is re-typed the next time the
+    /// keeper calls `save_cl_snapshot` for it (see `register_tracked_pool`);
+    /// until then `get_twap_all` reports it as `CrossContractCallFailed`
+    /// instead of trapping.
+    fn load_tracked(env: &Env) -> Vec<TrackedPool> {
+        if let Some(tracked) = env.storage().persistent().get(&DataKey::TrackedPools) {
+            return tracked;
+        }
+        let legacy: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TrackedPoolsPersistent)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut tracked = Vec::new(env);
+        for address in legacy.iter() {
+            tracked.push_back(TrackedPool {
+                address,
+                pool_type: PoolType::Amm,
+            });
+        }
+        tracked
+    }
+
+    /// Writes the typed tracked-pool set and drops the legacy untyped list,
+    /// completing the migration described on `load_tracked`.
+    fn store_tracked(env: &Env, tracked: &Vec<TrackedPool>) {
+        let storage = env.storage().persistent();
+        storage.set(&DataKey::TrackedPools, tracked);
+        storage.extend_ttl(
+            &DataKey::TrackedPools,
+            Self::SNAPSHOT_TTL_LEDGERS / 2,
+            Self::SNAPSHOT_TTL_LEDGERS,
+        );
+        if storage.has(&DataKey::TrackedPoolsPersistent) {
+            storage.remove(&DataKey::TrackedPoolsPersistent);
+        }
+    }
+
+    /// Adds `pool` to the tracked set as `pool_type`, or updates its type if
+    /// it is already tracked as the other one. A pool's type is decided by the
+    /// snapshot call that succeeded for it, and each call only succeeds
+    /// against the matching oracle interface, so re-typing can only correct a
+    /// migrated legacy entry, never corrupt a good one.
+    fn register_tracked_pool(env: &Env, pool: &Address, pool_type: PoolType) {
+        let mut tracked = Self::load_tracked(env);
+        for i in 0..tracked.len() {
+            let mut entry = tracked.get(i).unwrap();
+            if entry.address == *pool {
+                if entry.pool_type == pool_type {
+                    return;
+                }
+                entry.pool_type = pool_type;
+                tracked.set(i, entry);
+                Self::store_tracked(env, &tracked);
+                return;
+            }
+        }
+        tracked.push_back(TrackedPool {
+            address: pool.clone(),
+            pool_type,
+        });
+        Self::store_tracked(env, &tracked);
+    }
+
+    /// `get_price_cumulative` on an AMM pool, with any failure of the call
+    /// itself reported as `CrossContractCallFailed` rather than a host trap.
+    fn amm_price_cumulative(env: &Env, pool: &Address) -> Result<(i128, i128, u64), TwapError> {
+        match AmmPoolOracleClient::new(env, pool).try_get_price_cumulative() {
+            Ok(Ok(v)) => Ok(v),
+            _ => Err(TwapError::CrossContractCallFailed),
+        }
+    }
+
+    /// `get_tick_cumulative` on a CL pool, with any failure of the call itself
+    /// reported as `CrossContractCallFailed` rather than a host trap.
+    fn cl_tick_cumulative(env: &Env, pool: &Address) -> Result<(i64, u64), TwapError> {
+        match ClPoolOracleClient::new(env, pool).try_get_tick_cumulative() {
+            Ok(Ok(v)) => Ok(v),
+            _ => Err(TwapError::CrossContractCallFailed),
+        }
     }
 
     /// Record `ts` in the pool's sorted snapshot-timestamp index. Ledger
@@ -413,11 +565,11 @@ impl TwapConsumer {
     }
 
     pub fn get_twap_price(env: Env, pool: Address, window_seconds: u64) -> Result<i128, TwapError> {
+        Self::extend_instance_ttl(&env);
         if window_seconds == 0 {
             return Err(TwapError::ZeroWindow);
         }
-        let (cum_a_now, _cum_b_now, pool_ts_now) =
-            AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
+        let (cum_a_now, _cum_b_now, pool_ts_now) = Self::amm_price_cumulative(&env, &pool)?;
         let ledger_ts_now = env.ledger().timestamp();
         if ledger_ts_now < window_seconds {
             return Err(TwapError::InsufficientHistory);
@@ -475,6 +627,7 @@ impl TwapConsumer {
         spot_price: i128,
         max_deviation_bps: i128,
     ) -> Result<PriceValidation, TwapError> {
+        Self::extend_instance_ttl(&env);
         let twap_price = Self::get_twap_price(env, pool, window_seconds)?;
         Self::validate_price(spot_price, twap_price, max_deviation_bps)
     }
@@ -487,6 +640,7 @@ impl TwapConsumer {
         max_deviation_bps: i128,
         collateral_amount: i128,
     ) -> Result<i128, TwapError> {
+        Self::extend_instance_ttl(&env);
         if collateral_amount < 0 {
             return Err(TwapError::NegativeCollateral);
         }
@@ -508,11 +662,11 @@ impl TwapConsumer {
         pool: Address,
         window_seconds: u64,
     ) -> Result<(i128, i128), TwapError> {
+        Self::extend_instance_ttl(&env);
         if window_seconds == 0 {
             return Err(TwapError::ZeroWindow);
         }
-        let (cum_a_now, cum_b_now, pool_ts_now) =
-            AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
+        let (cum_a_now, cum_b_now, pool_ts_now) = Self::amm_price_cumulative(&env, &pool)?;
         let ledger_ts_now = env.ledger().timestamp();
         if ledger_ts_now < window_seconds {
             return Err(TwapError::InsufficientHistory);
@@ -535,7 +689,50 @@ impl TwapConsumer {
         Ok((delta_a / elapsed, delta_b / elapsed))
     }
 
+    /// Addresses of every tracked pool, of either type. See
+    /// `get_tracked_pools_typed` for each pool's type.
     pub fn get_tracked_pools(env: Env) -> Vec<Address> {
+        let tracked = Self::load_tracked(&env);
+        let mut out = Vec::new(&env);
+        for entry in tracked.iter() {
+            out.push_back(entry.address);
+        }
+        out
+    }
+
+    /// The tracked-pool set with each pool's type.
+    pub fn get_tracked_pools_typed(env: Env) -> Vec<TrackedPool> {
+        Self::load_tracked(&env)
+    }
+
+    /// TWAP for every tracked pool, dispatched by pool type: `get_twap_price`
+    /// for `Amm` pools and `get_cl_twap` for `Cl` pools. Each entry carries
+    /// its pool type because the two report different quantities (see
+    /// `TwapEntry`).
+    ///
+    /// Returns the first error encountered, like `twal_consumer::get_twal_all`.
+    /// A pool that does not implement the interface its type implies yields
+    /// `CrossContractCallFailed` rather than a host trap (#964).
+    pub fn get_twap_all(env: Env, window_seconds: u64) -> Result<Vec<TwapEntry>, TwapError> {
+        let tracked = Self::load_tracked(&env);
+        let mut results = Vec::new(&env);
+        for entry in tracked.iter() {
+            let twap = match entry.pool_type {
+                PoolType::Amm => {
+                    Self::get_twap_price(env.clone(), entry.address.clone(), window_seconds)?
+                }
+                PoolType::Cl => i128::from(Self::get_cl_twap(
+                    env.clone(),
+                    entry.address.clone(),
+                    window_seconds,
+                )?),
+            };
+            results.push_back(TwapEntry {
+                pool: entry.address,
+                pool_type: entry.pool_type,
+                twap,
+            });
+        Self::extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::TrackedPoolsPersistent)
@@ -543,6 +740,7 @@ impl TwapConsumer {
     }
 
     pub fn get_twap_all(env: Env, window_seconds: u64) -> Result<Vec<(Address, i128)>, TwapError> {
+        Self::extend_instance_ttl(&env);
         let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
         let mut results: Vec<(Address, i128)> = Vec::new(&env);
         for i in 0..tracked.len() {
@@ -554,10 +752,11 @@ impl TwapConsumer {
     }
 
     pub fn get_cl_twap(env: Env, pool: Address, window_seconds: u64) -> Result<i64, TwapError> {
+        Self::extend_instance_ttl(&env);
         if window_seconds == 0 {
             return Err(TwapError::ZeroWindow);
         }
-        let (cum_now, last_ts_now) = ClPoolOracleClient::new(&env, &pool).get_tick_cumulative();
+        let (cum_now, last_ts_now) = Self::cl_tick_cumulative(&env, &pool)?;
         let ledger_ts_now = env.ledger().timestamp();
         if ledger_ts_now < window_seconds {
             return Err(TwapError::InsufficientHistory);
@@ -580,8 +779,9 @@ impl TwapConsumer {
     }
 
     pub fn save_cl_snapshot(env: Env, pool: Address) -> Result<(), TwapError> {
+        Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
-        let (tick_cum, pool_ts) = ClPoolOracleClient::new(&env, &pool).get_tick_cumulative();
+        let (tick_cum, pool_ts) = Self::cl_tick_cumulative(&env, &pool)?;
         let ledger_ts = env.ledger().timestamp();
         let snapshot = PriceSnapshot {
             cum_a: tick_cum as i128,
@@ -596,30 +796,7 @@ impl TwapConsumer {
             Self::SNAPSHOT_TTL_LEDGERS,
         );
         Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
-
-        let mut tracked: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TrackedPoolsPersistent)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut already_tracked = false;
-        for i in 0..tracked.len() {
-            if tracked.get(i).unwrap() == pool {
-                already_tracked = true;
-                break;
-            }
-        }
-        if !already_tracked {
-            tracked.push_back(pool.clone());
-            env.storage()
-                .persistent()
-                .set(&DataKey::TrackedPoolsPersistent, &tracked);
-            env.storage().persistent().extend_ttl(
-                &DataKey::TrackedPoolsPersistent,
-                Self::SNAPSHOT_TTL_LEDGERS / 2,
-                Self::SNAPSHOT_TTL_LEDGERS,
-            );
-        }
+        Self::register_tracked_pool(&env, &pool, PoolType::Cl);
 
         // Opportunistic bounded amortised pruning
         let _ = Self::prune_snapshots_internal(&env, &pool, Self::AMORTIZED_PRUNE_LIMIT);
@@ -629,23 +806,33 @@ impl TwapConsumer {
 
 /// Minimal mock CL pool used by tests only. Satisfies the `ClPoolOracle`
 /// interface (`get_tick_cumulative`) without requiring the full CL contract.
+/// Reports `(1_000, 10_000)` until a test moves it with `set_tick_cumulative`.
 #[cfg(test)]
 mod mock_cl_pool {
-    use soroban_sdk::{contract, contractimpl, Env};
+    use soroban_sdk::{contract, contractimpl, symbol_short, Env};
 
     #[contract]
     pub struct MockClPool;
 
     #[contractimpl]
     impl MockClPool {
-        pub fn get_tick_cumulative(_env: Env) -> (i64, u64) {
-            (1_000_i64, 10_000_u64)
+        pub fn get_tick_cumulative(env: Env) -> (i64, u64) {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("tick_cum"))
+                .unwrap_or((1_000_i64, 10_000_u64))
+        }
+
+        pub fn set_tick_cumulative(env: Env, tick_cum: i64, ts: u64) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("tick_cum"), &(tick_cum, ts));
         }
     }
 }
 
 #[cfg(test)]
-use mock_cl_pool::MockClPool;
+use mock_cl_pool::{MockClPool, MockClPoolClient};
 
 #[cfg(test)]
 mod tests {
@@ -654,7 +841,7 @@ mod tests {
 
     use amm::{AmmPool, AmmPoolClient};
     use soroban_sdk::{
-        testutils::{Address as _, Events as _, Ledger},
+        testutils::{storage::Instance as _, Address as _, Events as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, Env, IntoVal,
     };
@@ -1119,12 +1306,12 @@ mod tests {
         let twap2 = consumer.get_twap_price(&amm_addr2, &60_u64);
         assert_eq!(twap2, 2_000_000);
 
-        for i in 0..all_twaps.len() {
-            let (pool, twap) = all_twaps.get(i).unwrap();
-            if pool == amm_addr1 {
-                assert_eq!(twap, twap1);
+        for entry in all_twaps.iter() {
+            assert_eq!(entry.pool_type, PoolType::Amm);
+            if entry.pool == amm_addr1 {
+                assert_eq!(entry.twap, twap1);
             } else {
-                assert_eq!(twap, twap2);
+                assert_eq!(entry.twap, twap2);
             }
         }
     }
@@ -1365,7 +1552,10 @@ mod tests {
         expected_topics.push_back(symbol_short!("snap_del").into_val(&env));
         expected_topics.push_back(pool.clone().into_val(&env));
         assert_eq!(topics, expected_topics);
-        let data_ts: u64 = data.into_val(&env);
+        // Issue #920: the payload is version-stamped as `(EVENT_SCHEMA_VERSION, T)`.
+        let (version, data_ts): (u32, u64) = data.into_val(&env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
         assert_eq!(data_ts, ledger_ts);
     }
 
@@ -1951,8 +2141,370 @@ mod tests {
         expected_topics.push_back(pool.clone().into_val(&env));
         assert_eq!(topics, expected_topics);
 
-        let (count_val, oldest_ts_val): (u32, u64) = data.into_val(&env);
+        // Issue #920: the payload is version-stamped as `(EVENT_SCHEMA_VERSION, T)`.
+        let (version, (count_val, oldest_ts_val)): (u32, (u32, u64)) = data.into_val(&env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
         assert_eq!(count_val, 2);
         assert_eq!(oldest_ts_val, 200_000);
+    }
+
+    // ── #964: typed tracked pools ────────────────────────────────────────────
+
+    /// A seeded 1:1 AMM pool plus the pieces needed to move its cumulative.
+    struct SeededAmm<'a> {
+        address: Address,
+        client: AmmPoolClient<'a>,
+        token_a: Address,
+        sac_a: StellarAssetClient<'a>,
+    }
+
+    fn seeded_amm<'a>(env: &'a Env, admin: &Address) -> SeededAmm<'a> {
+        let address = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(env, &lp_addr).initialize(
+            &address,
+            &soroban_sdk::String::from_str(env, "LP"),
+            &soroban_sdk::String::from_str(env, "LP"),
+            &7u32,
+        );
+        let (ta, sac_a) = create_sac(env, admin);
+        let (tb, sac_b) = create_sac(env, admin);
+        let client = AmmPoolClient::new(env, &address);
+        client.initialize(
+            admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            admin,
+            &0_i128,
+        );
+        let provider = Address::generate(env);
+        sac_a.mint(&provider, &2_000_000_i128);
+        sac_b.mint(&provider, &2_000_000_i128);
+        client.add_liquidity(
+            &provider,
+            &2_000_000_i128,
+            &2_000_000_i128,
+            &0_i128,
+            &(env.ledger().timestamp() + 10_000),
+        );
+        SeededAmm {
+            address,
+            client,
+            token_a: ta.address,
+            sac_a,
+        }
+    }
+
+    /// A small swap at the current ledger time, so the pool's price
+    /// cumulative advances to it.
+    fn poke_amm(env: &Env, amm: &SeededAmm) {
+        let whale = Address::generate(env);
+        amm.sac_a.mint(&whale, &1_000_i128);
+        amm.client.swap(
+            &whale,
+            &amm.token_a,
+            &1_000_i128,
+            &0_i128,
+            &env.ledger().timestamp(),
+        );
+    }
+
+    fn new_consumer<'a>(env: &'a Env, admin: &Address) -> TwapConsumerClient<'a> {
+        let consumer = TwapConsumerClient::new(env, &env.register_contract(None, TwapConsumer));
+        consumer.initialize(admin);
+        consumer
+    }
+
+    #[test]
+    fn test_get_twap_all_returns_mixed_amm_and_cl_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let admin = Address::generate(&env);
+
+        let amm = seeded_amm(&env, &admin);
+        let cl_addr = env.register_contract(None, MockClPool);
+        let cl = MockClPoolClient::new(&env, &cl_addr);
+        let consumer = new_consumer(&env, &admin);
+
+        consumer.save_snapshot(&amm.address);
+        consumer.save_cl_snapshot(&cl_addr);
+
+        let typed = consumer.get_tracked_pools_typed();
+        assert_eq!(
+            typed,
+            soroban_sdk::vec![
+                &env,
+                TrackedPool {
+                    address: amm.address.clone(),
+                    pool_type: PoolType::Amm,
+                },
+                TrackedPool {
+                    address: cl_addr.clone(),
+                    pool_type: PoolType::Cl,
+                },
+            ]
+        );
+
+        // 60 seconds later: the AMM trades at 1:1 and the CL pool has sat at
+        // tick -250 the whole time (cumulative 1_000 -> 1_000 - 250 * 60).
+        env.ledger().set_timestamp(10_060);
+        poke_amm(&env, &amm);
+        cl.set_tick_cumulative(&(1_000_i64 - 250 * 60), &10_060_u64);
+
+        let amm_alone = consumer.get_twap_price(&amm.address, &60_u64);
+        let cl_alone = consumer.get_cl_twap(&cl_addr, &60_u64);
+        assert_eq!(amm_alone, 1_000_000);
+        assert_eq!(cl_alone, -250);
+
+        // Both entries are present, correctly tagged, and each equals the
+        // value its own single-pool query reports: the CL pool no longer
+        // affects the AMM entry.
+        let all = consumer.get_twap_all(&60_u64);
+        assert_eq!(
+            all,
+            soroban_sdk::vec![
+                &env,
+                TwapEntry {
+                    pool: amm.address.clone(),
+                    pool_type: PoolType::Amm,
+                    twap: amm_alone,
+                },
+                TwapEntry {
+                    pool: cl_addr.clone(),
+                    pool_type: PoolType::Cl,
+                    twap: i128::from(cl_alone),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_interface_mismatch_is_a_typed_error_not_a_trap() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let admin = Address::generate(&env);
+
+        let amm = seeded_amm(&env, &admin);
+        let cl_addr = env.register_contract(None, MockClPool);
+        let not_a_contract = Address::generate(&env);
+        let consumer = new_consumer(&env, &admin);
+
+        // Each path called against the wrong interface, or against no
+        // contract at all, reports CrossContractCallFailed.
+        let failed = Ok(TwapError::CrossContractCallFailed);
+        assert_eq!(consumer.try_save_snapshot(&cl_addr).unwrap_err(), failed);
+        assert_eq!(
+            consumer.try_save_cl_snapshot(&amm.address).unwrap_err(),
+            failed
+        );
+        assert_eq!(
+            consumer.try_get_twap_price(&cl_addr, &60_u64).unwrap_err(),
+            failed
+        );
+        assert_eq!(
+            consumer.try_get_twap_both(&cl_addr, &60_u64).unwrap_err(),
+            failed
+        );
+        assert_eq!(
+            consumer.try_get_cl_twap(&amm.address, &60_u64).unwrap_err(),
+            failed
+        );
+        assert_eq!(
+            consumer
+                .try_get_cl_twap(&not_a_contract, &60_u64)
+                .unwrap_err(),
+            failed
+        );
+
+        // A failed save registers nothing.
+        assert_eq!(consumer.get_tracked_pools().len(), 0);
+    }
+
+    #[test]
+    fn test_legacy_untyped_tracked_pools_are_migrated() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let admin = Address::generate(&env);
+
+        let amm = seeded_amm(&env, &admin);
+        let cl_addr = env.register_contract(None, MockClPool);
+        let cl = MockClPoolClient::new(&env, &cl_addr);
+        let consumer = new_consumer(&env, &admin);
+
+        // State as a pre-#964 contract left it: snapshots for both pools and
+        // an untyped tracked list that includes the CL pool.
+        consumer.save_snapshot(&amm.address);
+        consumer.save_cl_snapshot(&cl_addr);
+        env.as_contract(&consumer.address, || {
+            let storage = env.storage().persistent();
+            storage.remove(&DataKey::TrackedPools);
+            let legacy = soroban_sdk::vec![&env, amm.address.clone(), cl_addr.clone()];
+            storage.set(&DataKey::TrackedPoolsPersistent, &legacy);
+        });
+
+        // Legacy entries read as Amm, in their stored order.
+        let typed = consumer.get_tracked_pools_typed();
+        assert_eq!(typed.len(), 2);
+        assert!(typed.iter().all(|t| t.pool_type == PoolType::Amm));
+        assert_eq!(
+            consumer.get_tracked_pools(),
+            soroban_sdk::vec![&env, amm.address.clone(), cl_addr.clone()]
+        );
+
+        env.ledger().set_timestamp(10_060);
+        poke_amm(&env, &amm);
+        cl.set_tick_cumulative(&(1_000_i64 + 100 * 60), &10_060_u64);
+
+        // The mis-typed CL entry is a typed error, not a trap.
+        assert_eq!(
+            consumer.try_get_twap_all(&60_u64),
+            Err(Ok(TwapError::CrossContractCallFailed))
+        );
+
+        // The keeper's next CL snapshot re-types it and writes the typed list;
+        // the legacy key is gone and order is preserved.
+        consumer.save_cl_snapshot(&cl_addr);
+        let typed = consumer.get_tracked_pools_typed();
+        assert_eq!(typed.get(0).unwrap().address, amm.address);
+        assert_eq!(typed.get(0).unwrap().pool_type, PoolType::Amm);
+        assert_eq!(typed.get(1).unwrap().address, cl_addr);
+        assert_eq!(typed.get(1).unwrap().pool_type, PoolType::Cl);
+        env.as_contract(&consumer.address, || {
+            assert!(!env
+                .storage()
+                .persistent()
+                .has(&DataKey::TrackedPoolsPersistent));
+        });
+
+        let all = consumer.get_twap_all(&60_u64);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get(0).unwrap().twap, 1_000_000);
+        assert_eq!(all.get(1).unwrap().pool_type, PoolType::Cl);
+        assert_eq!(all.get(1).unwrap().twap, 100);
+    }
+
+    #[test]
+    fn test_saving_again_keeps_one_entry_per_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let admin = Address::generate(&env);
+
+        let amm = seeded_amm(&env, &admin);
+        let cl_addr = env.register_contract(None, MockClPool);
+        let consumer = new_consumer(&env, &admin);
+
+        consumer.save_snapshot(&amm.address);
+        consumer.save_cl_snapshot(&cl_addr);
+        env.ledger().set_timestamp(10_060);
+        consumer.save_snapshot(&amm.address);
+        consumer.save_cl_snapshot(&cl_addr);
+
+        let typed = consumer.get_tracked_pools_typed();
+        assert_eq!(typed.len(), 2);
+        assert_eq!(typed.get(0).unwrap().pool_type, PoolType::Amm);
+        assert_eq!(typed.get(1).unwrap().pool_type, PoolType::Cl);
+    // ── Issue #910: instance storage TTL is never extended ──────────────────
+    //
+    // `twap_consumer` used to extend only its persistent snapshot entries,
+    // never the instance entry holding the keeper address and retention
+    // policy. A low-traffic oracle consumer that goes unread for long
+    // enough would let that instance entry's TTL lapse and get archived,
+    // trapping every subsequent call until someone restores it. These tests
+    // pin `extend_instance_ttl` in place on the read and write entrypoints.
+
+    fn instance_ttl(env: &Env, consumer: &TwapConsumerClient<'_>) -> u32 {
+        env.as_contract(&consumer.address, || env.storage().instance().get_ttl())
+    }
+
+    /// Advances the ledger sequence number far enough that the instance
+    /// entry's remaining TTL drops below `INSTANCE_TTL_THRESHOLD`, simulating
+    /// a long quiet stretch between calls to a sparsely-read oracle consumer.
+    fn lower_instance_ttl_below_threshold(env: &Env, consumer: &TwapConsumerClient<'_>) {
+        env.ledger().with_mut(|l| {
+            l.sequence_number +=
+                TwapConsumer::INSTANCE_TTL_BUMP_TO - TwapConsumer::INSTANCE_TTL_THRESHOLD + 1
+        });
+        let ttl = instance_ttl(env, consumer);
+        assert!(
+            ttl < TwapConsumer::INSTANCE_TTL_THRESHOLD,
+            "test setup should lower instance TTL below the threshold, got {ttl}"
+        );
+    }
+
+    fn assert_instance_ttl_bumped(env: &Env, consumer: &TwapConsumerClient<'_>) {
+        let ttl = instance_ttl(env, consumer);
+        assert!(
+            ttl >= TwapConsumer::INSTANCE_TTL_BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward INSTANCE_TTL_BUMP_TO"
+        );
+    }
+
+    #[test]
+    fn test_initialize_extends_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        consumer.initialize(&admin);
+
+        assert_instance_ttl_bumped(&env, &consumer);
+    }
+
+    /// A read-only entrypoint (`get_keeper`) still restores a lapsed
+    /// instance TTL — this is the failure mode the issue calls out: a
+    /// read-only path is often the only traffic this contract sees for long
+    /// stretches, so it must extend the TTL too, not just the writes.
+    #[test]
+    fn test_get_keeper_restores_lapsed_instance_ttl_and_still_responds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        lower_instance_ttl_below_threshold(&env, &consumer);
+
+        // The call must still succeed rather than trap on an archived
+        // instance entry, and it must restore the TTL for the next caller.
+        let keeper = consumer.get_keeper();
+        assert_eq!(keeper, admin);
+        assert_instance_ttl_bumped(&env, &consumer);
+    }
+
+    /// A state-mutating entrypoint (`set_retention_policy`) restores a
+    /// lapsed instance TTL as its first statement, before the keeper check
+    /// even runs.
+    #[test]
+    fn test_set_retention_policy_restores_lapsed_instance_ttl_and_still_responds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        lower_instance_ttl_below_threshold(&env, &consumer);
+
+        // Must still succeed rather than trap on an archived instance entry.
+        consumer.set_retention_policy(
+            &admin,
+            &RetentionPolicy {
+                max_age_seconds: TwapConsumer::LONGEST_TWAP_WINDOW,
+                max_snapshots_per_pool: 100,
+            },
+        );
+
+        assert_instance_ttl_bumped(&env, &consumer);
+        assert_eq!(consumer.get_retention_policy().max_snapshots_per_pool, 100);
     }
 }
