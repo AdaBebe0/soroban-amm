@@ -1984,6 +1984,7 @@ name = "v2_to_v3_migration"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "pool_interfaces",
  "soroban-sdk",
  "soroban_amm_sdk",
  "token",
